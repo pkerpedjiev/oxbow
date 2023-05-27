@@ -45,7 +45,7 @@ impl VcfReader {
     /// let ipc = reader.records_to_ipc(Some("sq0:1-1000")).unwrap();
     /// ```
     pub fn records_to_ipc(&mut self, region: Option<&str>) -> Result<Vec<u8>, ArrowError> {
-        let batch_builder = VcfBatchBuilder::new(1024, &self.header)?;
+        let mut batch_builder = VcfBatchBuilder::new(1024, &self.header)?;
         if let Some(region) = region {
             let region: Region = region.parse().unwrap();
             let query = self
@@ -53,10 +53,49 @@ impl VcfReader {
                 .query(&self.header, &region)
                 .unwrap()
                 .map(|r| r.unwrap());
-            return write_ipc(query, batch_builder);
+            todo!();
         }
-        let records = self.reader.records(&self.header).map(|r| r.unwrap());
-        write_ipc(records, batch_builder)
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match read_line(self.reader.get_mut(), &mut buf)? {
+                0 => break,
+                _ => {
+                    batch_builder.push(&buf);
+                }
+            }
+        }
+
+        let batch = batch_builder.finish()?;
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(Vec::new(), &batch.schema())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        writer.into_inner()
+    }
+}
+
+// Reads all bytes until a line feed ('\n') or EOF is reached.
+//
+// The buffer will not include the trailing newline ('\n' or '\r\n').
+fn read_line<R>(reader: &mut R, buf: &mut String) -> std::io::Result<usize>
+where
+    R: std::io::BufRead,
+{
+    const LINE_FEED: char = '\n';
+    const CARRIAGE_RETURN: char = '\r';
+
+    match reader.read_line(buf) {
+        Ok(0) => Ok(0),
+        Ok(n) => {
+            if buf.ends_with(LINE_FEED) {
+                buf.pop();
+                if buf.ends_with(CARRIAGE_RETURN) {
+                    buf.pop();
+                }
+            }
+            Ok(n)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -99,20 +138,19 @@ impl VcfBatchBuilder {
 }
 
 impl BatchBuilder for VcfBatchBuilder {
-    type Record = vcf::record::Record;
+    type Record = String;
 
     fn push(&mut self, record: &Self::Record) {
-        self.chrom.append_value(record.chromosome().to_string());
-        self.pos.append_value(usize::from(record.position()) as i32);
-        self.id.append_value(record.ids().to_string());
-        self.ref_.append_value(record.reference_bases().to_string());
-        self.alt.append_value(record.alternate_bases().to_string());
-        self.qual
-            .append_option(record.quality_score().map(f32::from));
-        self.filter
-            .append_option(record.filters().map(|f| f.to_string()));
-        self.info.append_value(record.info().to_string());
-        self.format.append_value(record.format().to_string());
+        let mut fields = record.split('\t');
+        self.chrom.append_option(fields.next());
+        self.pos.append_option(fields.next().map(|x| x.parse().unwrap()));
+        self.id.append_option(fields.next());
+        self.ref_.append_option(fields.next());
+        self.alt.append_option(fields.next());
+        self.qual.append_option(fields.next().map(|x| x.parse().unwrap()));
+        self.filter.append_option(fields.next());
+        self.info.append_option(fields.next());
+        self.format.append_option(fields.next());
     }
 
     fn finish(mut self) -> Result<RecordBatch, ArrowError> {
