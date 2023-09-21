@@ -462,11 +462,11 @@ mod tests {
         arrow_reader.next().unwrap().unwrap()
     }
 
-    fn read_record_batch(region: Option<&str>) -> RecordBatch {
+    fn read_record_batch(region: Option<&str>, tags: Option<HashSet<&str>>) -> RecordBatch {
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         dir.push("../fixtures/sample.bam");
         let mut reader = BamReader::new_from_path(dir.to_str().unwrap()).unwrap();
-        let ipc = reader.records_to_ipc(region).unwrap();
+        let ipc = reader.records_to_ipc(region, tags).unwrap();
         record_batch_from_ipc(ipc)
     }
 
