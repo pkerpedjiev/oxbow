@@ -18,6 +18,7 @@ use oxbow::bcf::BcfReader;
 use oxbow::gff::GffReader;
 use oxbow::gtf::GtfReader;
 use oxbow::vcf::VcfReader;
+use oxbow::tabix::TabixReader;
 
 use oxbow::vpos;
 
@@ -329,6 +330,14 @@ fn read_gtf(py: Python, path_or_file_like: PyObject) -> PyObject {
     }
 }
 
+#[pyfunction]
+fn read_tabix(path: &str, region: Option<&str>) -> PyObject {
+    let mut reader = TabixReader::new_from_path(path).unwrap();
+    let ipc = reader.records_to_ipc(region).unwrap();
+    Python::with_gil(|py| PyBytes::new(py, &ipc).into()) 
+}
+
+
 #[pymodule]
 #[pyo3(name = "oxbow")]
 fn py_oxbow(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -347,5 +356,6 @@ fn py_oxbow(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_bigbed, m)?)?;
     m.add_function(wrap_pyfunction!(read_gff, m)?)?;
     m.add_function(wrap_pyfunction!(read_gtf, m)?)?;
+    m.add_function(wrap_pyfunction!(read_tabix, m)?)?;
     Ok(())
 }

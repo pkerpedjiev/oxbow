@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io; 
 // use std::io::{self, BufReader, Read, Seek};
+use std::io::{Read, Seek};
 // use std::path::Path;
 use std::sync::Arc;
 
@@ -9,30 +10,49 @@ use arrow::array::{
 };
 use arrow::{error::ArrowError, record_batch::RecordBatch};
 use noodles::core::Region;
-use noodles::csi::io::IndexedRecord;
+use noodles::csi::io::{IndexedRecord, IndexedReader};
+// use noodles::csi::io::IndexedRecords;
+// use noodles::csi::io::Query;
 use noodles::{bgzf, csi, tabix};
 
 use crate::batch_builder::{write_ipc_err, BatchBuilder};
 
-pub struct TabixReader {
-    reader: csi::io::IndexedReader<bgzf::Reader<File>>,
+pub struct TabixReader<R> {
+    reader: csi::io::IndexedReader<bgzf::Reader<R>>,
 }
 
-impl TabixReader {
+impl TabixReader<File> {
     pub fn new_from_path(path: &str) -> io::Result<Self> {
-        let mut reader = tabix::io::indexed_reader::Builder::default().build_from_path(path)?;
+        let reader = tabix::io::indexed_reader::Builder::default().build_from_path(path)?;
+        Ok(Self { reader })
+    }
+}
+
+impl<R: Read + Seek> TabixReader<R> {
+    pub fn new(read: R, index: csi::Index) -> std::io::Result<Self> {
+        let reader = IndexedReader::new(read, index);
         Ok(Self { reader })
     }
 
     pub fn records_to_ipc(&mut self, region: Option<&str>) -> Result<Vec<u8>, ArrowError> {
-        let mut batch_builder = TabixBatchBuilder::new()?;
+        let batch_builder = TabixBatchBuilder::new()?;
         if let Some(region) = region {
             let region: Region = region.parse().unwrap();
             let query = self
                 .reader
                 .query(&region)
-                .map_err(|e| ArrowError::ExternalError(e.into()))?
-                .map(|i| i.map_err(|e| ArrowError::ExternalError(e.into())));
+                .map(|record| {
+                    record.map(|record| {
+                        let record = record.unwrap();
+                        let chrom = record.indexed_reference_sequence_name().to_string();
+                        let start = record.indexed_start_position().get() as i32;
+                        let end = record.indexed_end_position().get() as i32;
+                        let raw = record.as_ref().to_string();
+                        Ok(TabixRecord { chrom, start, end, raw })
+                    })
+                })
+                .map_err(|e| ArrowError::ExternalError(e.into()))?;
+                // .map(|i| i.map_err(|e| ArrowError::ExternalError(e.into())));
             return write_ipc_err(query, batch_builder);
         } else {
             // throw an error for now
@@ -41,11 +61,18 @@ impl TabixReader {
     }
 }
 
+pub struct TabixRecord {
+    chrom: String,
+    start: i32,
+    end: i32,
+    raw: String,
+}
+
 struct TabixBatchBuilder {
     chrom: GenericStringBuilder<i32>,
     start: Int32Builder,
     end: Int32Builder,
-    rest: GenericStringBuilder<i32>,
+    raw: GenericStringBuilder<i32>,
 }
 
 impl TabixBatchBuilder {
@@ -54,20 +81,20 @@ impl TabixBatchBuilder {
             chrom: GenericStringBuilder::new(),
             start: Int32Builder::new(),
             end: Int32Builder::new(),
-            rest: GenericStringBuilder::new(),
+            raw: GenericStringBuilder::new(),
         })
     }
 }
 
 impl BatchBuilder for TabixBatchBuilder {
-    type Record<'a> = &'a csi::io::indexed_records::record::Record;
-    // type Record<'a> = &'a dyn csi::io::IndexedRecord;
+    
+    type Record<'a> = &'a TabixRecord;
 
     fn push(&mut self, record: Self::Record<'_>) {
-        self.chrom.append_value(record.indexed_reference_sequence_name());
-        self.start.append_value(record.indexed_start_position().get() as i32);
-        self.end.append_value(record.indexed_end_position().get() as i32);
-        // self.rest.append_value(record.as_ref());
+        self.chrom.append_value(&record.chrom);
+        self.start.append_value(record.start);
+        self.end.append_value(record.end);
+        self.raw.append_value(&record.raw);
     }
 
     fn finish(mut self) -> Result<RecordBatch, ArrowError> {
@@ -75,26 +102,7 @@ impl BatchBuilder for TabixBatchBuilder {
             ("chrom", Arc::new(self.chrom.finish()) as ArrayRef),
             ("start", Arc::new(self.start.finish()) as ArrayRef),
             ("end", Arc::new(self.end.finish()) as ArrayRef),
-            ("rest", Arc::new(self.rest.finish()) as ArrayRef),
+            ("raw", Arc::new(self.raw.finish()) as ArrayRef),
         ])
     }
 }
-
-
-
-
-// fn main() -> Result<(), Box<dyn std::error::Error>>{
-
-//     let src = "/Users/nezar/local/devel/oxbow_project/oxbow/fixtures/ALL.chrY.phase3_integrated_v1a.20130502.genotypes.vcf.gz";
-//     let region = "Y:2657239-2700000".parse()?;
-    
-//     let mut reader = tabix::io::indexed_reader::Builder::default().build_from_path(src)?;
-//     let query = reader.query(&region)?;
-    
-//     for result in query {
-//         let record = result?;
-//         println!("{:?}", record.as_ref());
-//     };
-
-//     Ok(())
-// }
