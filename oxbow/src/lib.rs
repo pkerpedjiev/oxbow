@@ -35,3 +35,4 @@ pub mod bigwig;
 pub mod gff;
 pub mod gtf;
 pub mod vcf;
+pub mod tabix;
