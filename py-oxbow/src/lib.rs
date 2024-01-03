@@ -343,10 +343,27 @@ fn read_gtf(py: Python, path_or_file_like: PyObject) -> PyObject {
 }
 
 #[pyfunction]
-fn read_tabix(path: &str, region: Option<&str>) -> PyObject {
-    let mut reader = TabixReader::new_from_path(path).unwrap();
-    let ipc = reader.records_to_ipc(region).unwrap();
-    Python::with_gil(|py| PyBytes::new(py, &ipc).into()) 
+fn read_tabix(py: Python, path_or_file_like: PyObject, region: Option<&str>, index: Option<PyObject>) -> PyObject {
+    if let Ok(string_ref) = path_or_file_like.downcast::<PyString>(py) {
+        // If it's a string, treat it as a path
+        let mut reader = TabixReader::new_from_path(string_ref.to_str().unwrap()).unwrap();
+        let ipc = reader.records_to_ipc(region).unwrap();
+        Python::with_gil(|py| PyBytes::new(py, &ipc).into())
+    } else {
+        // Otherwise, treat it as file-like
+        let file_like = match PyFileLikeObject::new(path_or_file_like, true, false, true) {
+            Ok(file_like) => file_like,
+            Err(_) => panic!("Unknown argument for `path_url_or_file_like`. Not a file path string or url, and not a file-like object."),
+        };
+        let index_file_like = match PyFileLikeObject::new(index.unwrap(), true, false, true) {
+            Ok(file_like) => file_like,
+            Err(_) => panic!("Unknown argument for `index`. Not a file path string or url, and not a file-like object."),
+        };
+
+        let mut indexed_reader = TabixReader::new_from_file_and_index_pointers(file_like, index_file_like).unwrap();
+        let ipc = indexed_reader.records_to_ipc(region).unwrap();
+        Python::with_gil(|py| PyBytes::new(py, &ipc).into())
+    }
 }
 
 

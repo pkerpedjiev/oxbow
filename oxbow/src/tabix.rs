@@ -1,8 +1,6 @@
 use std::fs::File;
 use std::io; 
-// use std::io::{self, BufReader, Read, Seek};
 use std::io::{Read, Seek};
-// use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -11,8 +9,6 @@ use arrow::array::{
 use arrow::{error::ArrowError, record_batch::RecordBatch};
 use noodles::core::Region;
 use noodles::csi::io::{IndexedRecord, IndexedReader};
-// use noodles::csi::io::IndexedRecords;
-// use noodles::csi::io::Query;
 use noodles::{bgzf, csi, tabix};
 
 use crate::batch_builder::{write_ipc_err, BatchBuilder};
@@ -25,6 +21,21 @@ impl TabixReader<File> {
     pub fn new_from_path(path: &str) -> io::Result<Self> {
         let reader = tabix::io::indexed_reader::Builder::default().build_from_path(path)?;
         Ok(Self { reader })
+    }
+}
+
+impl<R> TabixReader<R> where R: Read + Seek {
+    pub fn new_from_file_and_index_pointers(inner: R, index: R) -> io::Result<Self>
+    where R: Read + Seek
+    {
+        let mut index_reader = tabix::Reader::new(index);
+
+        let indexed_reader = IndexedReader::new(
+            inner,
+            index_reader.read_index()?,
+        );
+
+        Ok(Self { reader: indexed_reader })
     }
 }
 
