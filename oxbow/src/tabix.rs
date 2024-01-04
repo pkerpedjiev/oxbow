@@ -17,6 +17,29 @@ use noodles::{bgzf, csi, tabix};
 
 use crate::batch_builder::{write_ipc_err, BatchBuilder};
 
+
+fn read_magic(read: &mut dyn Read) -> io::Result<[u8; 4]> {
+    let mut magic = [0; 4];
+    let mut bgzf_file = bgzf::Reader::new(read);
+    bgzf_file.read_exact(&mut magic)?;
+    Ok(magic)
+}
+
+pub fn index_from_reader<R>(mut read: R) -> io::Result<csi::Index>
+where
+    R: Read + Seek,
+{
+    let magic = read_magic(&mut read)?;
+    read.seek(io::SeekFrom::Start(0))?;
+    if magic == b"TBI\x01" as &[u8] {
+        let mut tbi_reader = tabix::Reader::new(read);
+        tbi_reader.read_index()
+    } else {
+        let mut csi_reader = csi::Reader::new(read);
+        csi_reader.read_index()
+    }
+}
+
 pub struct TabixReader<R> {
     reader: csi::io::IndexedReader<bgzf::Reader<R>>,
 }
