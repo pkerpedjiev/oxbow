@@ -1,20 +1,22 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow::array::ArrayBuilder;
 use arrow::array::{
-    ArrayRef, Float32Builder, GenericStringBuilder, Int16Builder, Int32Array, Int32Builder,
-    Int8Builder, StringArray, StringDictionaryBuilder, StructArray, UInt16Array, UInt16Builder,
-    UInt32Builder, UInt8Array, UInt8Builder,
+    ArrayRef, GenericStringBuilder, Int32Array, Int32Builder, StringArray, StringDictionaryBuilder,
+    UInt16Array, UInt16Builder, UInt8Array, UInt8Builder,
 };
 use arrow::ipc::writer::FileWriter;
 use arrow::{datatypes::Int32Type, error::ArrowError, record_batch::RecordBatch};
 use noodles::core::Region;
 use noodles::sam::record::data::field::Tag;
-use noodles::sam::record::Data;
+
 use noodles::{bam, bgzf, csi, sam};
+use std::collections::HashSet;
+use std::str::FromStr;
 
 use crate::batch_builder::{write_ipc_err, BatchBuilder};
 
@@ -65,6 +67,7 @@ impl BamReader<BufReader<File>> {
         let buf_file = std::io::BufReader::with_capacity(1024 * 1024, file);
         let mut reader = bam::Reader::new(buf_file);
         let header = reader.read_header()?;
+
         Ok(Self {
             reader,
             header,
@@ -78,6 +81,7 @@ impl<R: Read + Seek> BamReader<R> {
     pub fn new(read: R, index: csi::Index) -> std::io::Result<Self> {
         let mut reader = bam::Reader::new(read);
         let header = reader.read_header()?;
+
         Ok(Self {
             reader,
             header,
@@ -87,7 +91,9 @@ impl<R: Read + Seek> BamReader<R> {
 
     /// Returns the records in the given region as Apache Arrow IPC.
     ///
-    /// If the region is `None`, all records are returned.
+    /// If the region is `None`, all records are returned. The second paramter to
+    /// `records_to_ipc` is a set of tags to include in the output. If it is `None`,
+    /// all tags are included. If it is `Some`, only the tags in the set are included.
     ///
     /// # Examples
     ///
@@ -95,10 +101,14 @@ impl<R: Read + Seek> BamReader<R> {
     /// use oxbow::bam::BamReader;
     ///
     /// let mut reader = BamReader::new_from_path("sample.bam").unwrap();
-    /// let ipc = reader.records_to_ipc(Some("sq0:1-1000")).unwrap();
+    /// let ipc = reader.records_to_ipc(Some("sq0:1-1000"), None).unwrap();
     /// ```
-    pub fn records_to_ipc(&mut self, region: Option<&str>) -> Result<Vec<u8>, ArrowError> {
-        let batch_builder = BamBatchBuilder::new(1024, &self.header)?;
+    pub fn records_to_ipc(
+        &mut self,
+        region: Option<&str>,
+        tags: Option<HashSet<&str>>,
+    ) -> Result<Vec<u8>, ArrowError> {
+        let batch_builder = BamBatchBuilder::new(1024, &self.header, tags)?;
         if let Some(region) = region {
             let region: Region = region.parse().unwrap();
             let query = self
@@ -120,12 +130,13 @@ impl<R: Read + Seek> BamReader<R> {
         &mut self,
         pos_lo: (u64, u16),
         pos_hi: (u64, u16),
+        tags: Option<HashSet<&str>>,
     ) -> Result<Vec<u8>, ArrowError> {
         let vpos_lo = bgzf::VirtualPosition::try_from(pos_lo)
             .map_err(|e| ArrowError::ExternalError(e.into()))?;
         let vpos_hi = bgzf::VirtualPosition::try_from(pos_hi)
             .map_err(|e| ArrowError::ExternalError(e.into()))?;
-        let batch_builder = BamBatchBuilder::new(1024, &self.header)?;
+        let batch_builder = BamBatchBuilder::new(1024, &self.header, tags)?;
         let records = BamRecords::new(&mut self.reader, &self.header, vpos_lo, vpos_hi)
             .map(|i| i.map_err(|e| ArrowError::ExternalError(e.into())));
         write_ipc_err(records, batch_builder)
@@ -138,7 +149,7 @@ impl<R: Read + Seek> BamReader<R> {
 /// ```no_run
 /// use oxbow::bam::references_to_ipc;
 ///
-/// let file = std::fs::File::open("sample.bam").unwrap();
+/// let file = std::fs::File::open("sample.bam")?;
 /// let ipc = references_to_ipc(file).unwrap();
 /// ```
 pub fn references_to_ipc<R: Read + Seek>(read: R) -> Result<Vec<u8>, ArrowError> {
@@ -178,228 +189,16 @@ struct BamBatchBuilder<'a> {
     seq: GenericStringBuilder<i32>,
     qual: GenericStringBuilder<i32>,
     end: Int32Builder,
-    tags: TagsBuilder,
-}
-
-enum TagArrayBuilder {
-    Character(GenericStringBuilder<i32>),
-    Int8(Int8Builder),
-    UInt8(UInt8Builder),
-    Int16(Int16Builder),
-    UInt16(UInt16Builder),
-    Int32(Int32Builder),
-    UInt32(UInt32Builder),
-    Float(Float32Builder),
-    String(GenericStringBuilder<i32>),
-    Hex(GenericStringBuilder<i32>),
-}
-
-struct TagsBuilder {
-    inner: HashMap<Tag, TagArrayBuilder>,
-    seen: usize,
-    tags: HashSet<Tag>,
-}
-
-impl TagsBuilder {
-    pub fn new() -> Self {
-        Self {
-            inner: HashMap::new(),
-            seen: 0,
-            tags: HashSet::new(),
-        }
-    }
-
-    pub fn push_tags(&mut self, data: &'_ Data) {
-        use sam::record::data::field::Value;
-        self.tags.extend(data.keys());
-
-        for tag in self.tags.iter() {
-            match data.get(tag) {
-                Some(Value::Character(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = GenericStringBuilder::<i32>::new();
-                        builder.extend(std::iter::repeat(None::<&str>).take(self.seen));
-                        TagArrayBuilder::Character(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::Character(builder) => {
-                            builder.append_value(v.to_string());
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::Int8(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = Int8Builder::new();
-                        builder.extend(std::iter::repeat(None).take(self.seen));
-                        TagArrayBuilder::Int8(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::Int8(builder) => {
-                            builder.append_value(*v);
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::UInt8(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = UInt8Builder::new();
-                        builder.extend(std::iter::repeat(None).take(self.seen));
-                        TagArrayBuilder::UInt8(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::UInt8(builder) => {
-                            builder.append_value(*v);
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::Int16(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = Int16Builder::new();
-                        builder.extend(std::iter::repeat(None).take(self.seen));
-                        TagArrayBuilder::Int16(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::Int16(builder) => {
-                            builder.append_value(*v);
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::UInt16(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = UInt16Builder::new();
-                        builder.extend(std::iter::repeat(None).take(self.seen));
-                        TagArrayBuilder::UInt16(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::UInt16(builder) => {
-                            builder.append_value(*v);
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::Int32(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = Int32Builder::new();
-                        builder.extend(std::iter::repeat(None).take(self.seen));
-                        TagArrayBuilder::Int32(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::Int32(builder) => {
-                            builder.append_value(*v);
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::UInt32(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = UInt32Builder::new();
-                        builder.extend(std::iter::repeat(None).take(self.seen));
-                        TagArrayBuilder::UInt32(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::UInt32(builder) => {
-                            builder.append_value(*v);
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::Float(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = Float32Builder::new();
-                        builder.extend(std::iter::repeat(None).take(self.seen));
-                        TagArrayBuilder::Float(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::Float(builder) => {
-                            builder.append_value(*v);
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::String(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = GenericStringBuilder::<i32>::new();
-                        builder.extend(std::iter::repeat(None::<&str>).take(self.seen));
-                        TagArrayBuilder::String(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::String(builder) => {
-                            builder.append_value(v.as_str());
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::Hex(v)) => {
-                    let builder = self.inner.entry(*tag).or_insert_with(|| {
-                        let mut builder = GenericStringBuilder::<i32>::new();
-                        builder.extend(std::iter::repeat(None::<&str>).take(self.seen));
-                        TagArrayBuilder::Hex(builder)
-                    });
-                    match builder {
-                        TagArrayBuilder::Hex(builder) => {
-                            builder.append_value(v.as_ref());
-                        }
-                        _ => panic!("Wrong type"),
-                    }
-                }
-                Some(Value::Array(_)) => {
-                    panic!("Array not implemented");
-                }
-                None => match self.inner.get_mut(tag).expect("Tag not found") {
-                    TagArrayBuilder::Character(builder) => builder.append_null(),
-                    TagArrayBuilder::Int8(builder) => builder.append_null(),
-                    TagArrayBuilder::UInt8(builder) => builder.append_null(),
-                    TagArrayBuilder::Int16(builder) => builder.append_null(),
-                    TagArrayBuilder::UInt16(builder) => builder.append_null(),
-                    TagArrayBuilder::Int32(builder) => builder.append_null(),
-                    TagArrayBuilder::UInt32(builder) => builder.append_null(),
-                    TagArrayBuilder::Float(builder) => builder.append_null(),
-                    TagArrayBuilder::String(builder) => builder.append_null(),
-                    TagArrayBuilder::Hex(builder) => builder.append_null(),
-                },
-            }
-        }
-        self.seen += 1;
-    }
-
-    fn try_finish(&mut self) -> Result<StructArray, ArrowError> {
-        let keys = self.inner.keys().map(|x| x.to_string()).collect::<Vec<_>>();
-        let arrays: Vec<(&str, ArrayRef)> = self
-            .inner
-            .iter_mut()
-            .zip(keys.iter())
-            .map(|((_, builder), key)| {
-                let arr: ArrayRef = match builder {
-                    TagArrayBuilder::Character(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::Int8(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::UInt8(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::Int16(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::UInt16(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::Int32(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::UInt32(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::Float(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::String(builder) => Arc::new(builder.finish()) as ArrayRef,
-                    TagArrayBuilder::Hex(builder) => Arc::new(builder.finish()) as ArrayRef,
-                };
-                (key.as_str(), arr)
-            })
-            .collect();
-
-        StructArray::try_from(arrays)
-    }
-}
-
-impl Default for TagsBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+    tags: Option<HashSet<&'a str>>,
+    tag_values: HashMap<String, GenericStringBuilder<i32>>,
 }
 
 impl<'a> BamBatchBuilder<'a> {
-    pub fn new(capacity: usize, header: &'a sam::Header) -> Result<Self, ArrowError> {
+    pub fn new(
+        capacity: usize,
+        header: &'a sam::Header,
+        tags: Option<HashSet<&'a str>>,
+    ) -> Result<Self, ArrowError> {
         let categories = StringArray::from(
             header
                 .reference_sequences()
@@ -407,6 +206,7 @@ impl<'a> BamBatchBuilder<'a> {
                 .map(|(rs, _)| Some(rs.as_str()))
                 .collect::<Vec<_>>(),
         );
+
         Ok(Self {
             header,
             qname: GenericStringBuilder::<i32>::new(),
@@ -427,8 +227,68 @@ impl<'a> BamBatchBuilder<'a> {
             seq: GenericStringBuilder::<i32>::new(),
             qual: GenericStringBuilder::<i32>::new(),
             end: Int32Array::builder(capacity),
-            tags: TagsBuilder::new(),
+            tags,
+            tag_values: HashMap::new(),
         })
+    }
+
+    fn add_tags(&mut self, record: &sam::alignment::Record) {
+        // Add tags from a record to the tag_values hashmap. This is a method
+        // That is called by the BatchBuilder trait implementation but it's not
+        // part of the trait itself.
+        let tags;
+        match &self.tags {
+            Some(t) => {
+                tags = t
+                    .iter()
+                    .filter_map(|x| Tag::from_str(x).ok())
+                    .collect::<HashSet<_>>()
+            }
+
+            // if no tags are specified, return all tags
+            None => tags = record.data().keys().collect::<HashSet<_>>(),
+        }
+
+        // Go through each expected tag (the ones asked for or all tags if the asked for were omitted)
+        for tag in tags {
+            let tag_str = tag.to_string();
+
+            match record.data().get(&tag) {
+                // Does the record have the tag we're looking for?
+                // If it doesn't, we don't care and move on.
+                Some(value) => match self.tag_values.get_mut(tag_str.as_str()) {
+                    // See if we're already keeping track of this tag
+                    Some(tag_value) => {
+                        // If we are, we need to add in nulls for all the previous records
+                        // that didn't have this tag so that in the end all returned columns
+                        // have the same length
+                        while tag_value.len() < self.qname.len() - 1 {
+                            tag_value.append_null();
+                        }
+
+                        // Add the actual value
+                        tag_value.append_value(value.to_string());
+                    }
+                    None => {
+                        // We haven't seen this tag before so we have to create a GenericStringBuilder
+                        // to start adding values.
+                        let mut str_builder = GenericStringBuilder::<i32>::new();
+
+                        // Add null values for all the previous rows where this tag wasn't present
+                        while str_builder.len() < self.qname.len() - 1 {
+                            str_builder.append_null();
+                        }
+
+                        // Add the actual value
+                        str_builder.append_value(value.to_string());
+
+                        // Attach this GenericStringBuilder to the tag
+                        self.tag_values.insert(tag_str, str_builder);
+                    }
+                },
+                None => {}
+            }
+        }
     }
 }
 
@@ -462,28 +322,73 @@ impl<'a> BatchBuilder for BamBatchBuilder<'a> {
         // extra
         self.end
             .append_option(record.alignment_end().map(|x| x.get() as i32));
-        self.tags.push_tags(record.data());
+
+        // Add tag values. This is a little more complicated than the other fields so we're
+        // doing it in a separate method.
+        self.add_tags(record);
     }
 
     fn finish(mut self) -> Result<RecordBatch, ArrowError> {
-        let tags = self.tags.try_finish()?;
-        RecordBatch::try_from_iter(vec![
+        let num_records = self.qname.len();
+
+        let mut record_batch = vec![
             // spec
-            ("qname", Arc::new(self.qname.finish()) as ArrayRef),
-            ("flag", Arc::new(self.flag.finish()) as ArrayRef),
-            ("rname", Arc::new(self.rname.finish()) as ArrayRef),
-            ("pos", Arc::new(self.pos.finish()) as ArrayRef),
-            ("mapq", Arc::new(self.mapq.finish()) as ArrayRef),
-            ("cigar", Arc::new(self.cigar.finish()) as ArrayRef),
-            ("rnext", Arc::new(self.rnext.finish()) as ArrayRef),
-            ("pnext", Arc::new(self.pnext.finish()) as ArrayRef),
-            ("tlen", Arc::new(self.tlen.finish()) as ArrayRef),
-            ("seq", Arc::new(self.seq.finish()) as ArrayRef),
-            ("qual", Arc::new(self.qual.finish()) as ArrayRef),
-            ("tags", Arc::new(tags) as ArrayRef),
+            (
+                String::from("qname"),
+                Arc::new(self.qname.finish()) as ArrayRef,
+            ),
+            (
+                String::from("flag"),
+                Arc::new(self.flag.finish()) as ArrayRef,
+            ),
+            (
+                String::from("rname"),
+                Arc::new(self.rname.finish()) as ArrayRef,
+            ),
+            (String::from("pos"), Arc::new(self.pos.finish()) as ArrayRef),
+            (
+                String::from("mapq"),
+                Arc::new(self.mapq.finish()) as ArrayRef,
+            ),
+            (
+                String::from("cigar"),
+                Arc::new(self.cigar.finish()) as ArrayRef,
+            ),
+            (
+                String::from("rnext"),
+                Arc::new(self.rnext.finish()) as ArrayRef,
+            ),
+            (
+                String::from("pnext"),
+                Arc::new(self.pnext.finish()) as ArrayRef,
+            ),
+            (
+                String::from("tlen"),
+                Arc::new(self.tlen.finish()) as ArrayRef,
+            ),
+            (String::from("seq"), Arc::new(self.seq.finish()) as ArrayRef),
+            (
+                String::from("qual"),
+                Arc::new(self.qual.finish()) as ArrayRef,
+            ),
             // extra
-            ("end", Arc::new(self.end.finish()) as ArrayRef),
-        ])
+            (String::from("end"), Arc::new(self.end.finish()) as ArrayRef),
+        ];
+
+        // Add the tags
+        for (key, value) in self.tag_values.iter_mut() {
+            // If a tag appeared in some records but not the last ones, we need to
+            // fill in the remaining blanks with nulls
+            while value.len() < num_records {
+                value.append_null();
+            }
+
+            let array_ref = Arc::new(value.finish()) as ArrayRef;
+
+            record_batch.push((key.to_string(), array_ref));
+        }
+
+        RecordBatch::try_from_iter(record_batch)
     }
 }
 
@@ -557,29 +462,50 @@ mod tests {
         arrow_reader.next().unwrap().unwrap()
     }
 
-    fn read_record_batch(region: Option<&str>) -> RecordBatch {
+    fn read_record_batch(region: Option<&str>, tags: Option<HashSet<&str>>) -> RecordBatch {
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         dir.push("../fixtures/sample.bam");
         let mut reader = BamReader::new_from_path(dir.to_str().unwrap()).unwrap();
-        let ipc = reader.records_to_ipc(region).unwrap();
+        let ipc = reader.records_to_ipc(region, tags).unwrap();
         record_batch_from_ipc(ipc)
     }
 
     #[test]
+    fn test_read_tags() {
+        let record_batch = read_record_batch(None, Some(HashSet::from(["MD"])));
+
+        // Check to make sure the tags we requested are present
+        assert!(record_batch.column_by_name("MD").is_some());
+
+        // Check to make sure tags we didn't request are not present
+        assert!(record_batch.column_by_name("NM").is_none());
+
+        let record_batch = read_record_batch(None, None);
+
+        // Check to make sure both tags are present when no tags are specified
+        dbg!(&record_batch);
+
+        assert!(record_batch.column_by_name("MD").is_some());
+        assert!(record_batch.column_by_name("NM").is_some());
+
+        assert_eq!(record_batch.num_rows(), 6);
+    }
+
+    #[test]
     fn test_read_all() {
-        let record_batch = read_record_batch(None);
+        let record_batch = read_record_batch(None, None);
         assert_eq!(record_batch.num_rows(), 6);
     }
 
     #[test]
     fn test_region_full() {
-        let record_batch = read_record_batch(Some("chr1"));
+        let record_batch = read_record_batch(Some("chr1"), None);
         assert_eq!(record_batch.num_rows(), 4);
     }
 
     #[test]
     fn rest_region_partial() {
-        let record_batch = read_record_batch(Some("chr1:1-100000"));
+        let record_batch = read_record_batch(Some("chr1:1-100000"), None);
         assert_eq!(record_batch.num_rows(), 2);
     }
 
