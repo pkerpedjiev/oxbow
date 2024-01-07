@@ -23,11 +23,18 @@ use oxbow::gtf::GtfReader;
 use oxbow::vcf::VcfReader;
 use oxbow::tabix::TabixReader;
 
+use pyo3::create_exception;
+use pyo3::exceptions::PyException;
+use pyo3::exceptions::PyValueError;
+
 use oxbow::vpos;
 
 mod file_like;
 
 use file_like::PyFileLikeObject;
+
+create_exception!("oxbow", MissingReferenceError, PyException);
+
 
 #[pyfunction]
 fn partition_from_index_file(path: &str, chunksize: u64) -> PyObject {
@@ -355,12 +362,12 @@ fn read_gtf(py: Python, path_or_file_like: PyObject) -> PyObject {
 }
 
 #[pyfunction]
-fn read_tabix(py: Python, path_or_file_like: PyObject, region: Option<&str>, index: Option<PyObject>) -> PyObject {
+fn read_tabix(py: Python, path_or_file_like: PyObject, region: Option<&str>, index: Option<PyObject>) -> PyResult<PyObject> {
     if let Ok(string_ref) = path_or_file_like.downcast::<PyString>(py) {
         // If it's a string, treat it as a path
         let mut reader = TabixReader::new_from_path(string_ref.to_str().unwrap()).unwrap();
         let ipc = reader.records_to_ipc(region).unwrap();
-        Python::with_gil(|py| PyBytes::new(py, &ipc).into())
+        Ok(Python::with_gil(|py| PyBytes::new(py, &ipc).into()))
     } else {
         // Otherwise, treat it as file-like
         let file_like = match PyFileLikeObject::new(path_or_file_like, true, false, true) {
@@ -373,8 +380,11 @@ fn read_tabix(py: Python, path_or_file_like: PyObject, region: Option<&str>, ind
         };
         let index = tabix::index_from_reader(index_file_like).unwrap();
         let mut reader = TabixReader::new(file_like, index).unwrap();
-        let ipc = reader.records_to_ipc(region).unwrap();
-        Python::with_gil(|py| PyBytes::new(py, &ipc).into())
+
+        match reader.records_to_ipc(region) {
+            Ok(ipc) => return Ok(Python::with_gil(|py| PyBytes::new(py, &ipc).into())),
+            Err(e) => return Err(PyValueError::new_err(e.to_string()))
+        }
     }
 }
 
@@ -382,6 +392,7 @@ fn read_tabix(py: Python, path_or_file_like: PyObject, region: Option<&str>, ind
 #[pymodule]
 #[pyo3(name = "oxbow")]
 fn py_oxbow(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add("MissingReferenceError", _py.get_type::<MissingReferenceError>())?;
     m.add_function(wrap_pyfunction!(read_fasta, m)?)?;
     m.add_function(wrap_pyfunction!(read_fastq, m)?)?;
     m.add_function(wrap_pyfunction!(partition_from_index_file, m)?)?;
