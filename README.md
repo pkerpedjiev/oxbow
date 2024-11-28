@@ -1,4 +1,5 @@
 # oxbow <a href="https://github.com/abdenlab/oxbow"><img align="right" src="./assets/logo.svg" height="38"></img></a>
+[![DOI](https://zenodo.org/badge/641466193.svg)](https://zenodo.org/doi/10.5281/zenodo.10573864)
 
 Read specialized bioinformatic file formats as data frames in R, Python, and more.
 
@@ -21,4 +22,4 @@ Want to contribute? [Join us](https://oxbow.zulipchat.com)!
 ## Development
 
 The **oxbow** project is split into separate [Rust](./oxbow), [Python](./py-oxbow), and [R](./r-oxbow) packages.
-You can download sample data by [following these instructions](./data/README.md).
+You can download sample data by [following these instructions](./fixtures/README.md).

@@ -31,7 +31,6 @@ where
     read.seek(io::SeekFrom::Start(0))?;
     if magic == b"BAI\x01" as &[u8] {
         let mut bai_reader = bam::bai::Reader::new(read);
-        bai_reader.read_header()?;
         bai_reader.read_index()
     } else {
         let mut csi_reader = csi::Reader::new(read);

@@ -1,31 +1,31 @@
 use arrow::array::{ArrayRef, GenericStringBuilder};
 use arrow::{error::ArrowError, record_batch::RecordBatch};
-// use noodles::core::Region;
 use noodles::fastq;
-// use noodles::fastq::fai;
-use std::sync::Arc;
+use std::{
+    fs::File,
+    io::{self, BufReader, Read},
+    str,
+    sync::Arc,
+};
 
 use crate::batch_builder::{write_ipc, BatchBuilder};
 
-type BufferedReader = std::io::BufReader<std::fs::File>;
-
-/// A FASTQ reader.
-pub struct FastqReader {
-    reader: fastq::Reader<BufferedReader>,
-    // index: fai::Reader<std::io::BufReader<std::fs::File>>,
+pub struct FastqReader<R> {
+    reader: fastq::Reader<R>,
 }
 
-impl FastqReader {
-    /// Creates a Fastq Reader.
-    pub fn new(path: &str) -> std::io::Result<Self> {
-        // let index_file = std::fs::File::open(format!("{}.fai", path))?;
-        // let index_bufreader = std::io::BufReader::with_capacity(1024 * 1024, index_file);
-        // let index = fai::Reader::new(index_bufreader);
+impl FastqReader<BufReader<File>> {
+    pub fn new_from_path(path: &str) -> io::Result<Self> {
+        let reader = File::open(path)
+            .map(BufReader::new)
+            .map(fastq::Reader::new)?;
+        Ok(Self { reader })
+    }
+}
 
-        let file = std::fs::File::open(path)?;
-        let bufreader = std::io::BufReader::with_capacity(1024 * 1024, file);
-        let reader = fastq::reader::Reader::new(bufreader);
-
+impl<R: Read> FastqReader<BufReader<R>> {
+    pub fn new(read: R) -> io::Result<Self> {
+        let reader = fastq::Reader::new(BufReader::new(read));
         Ok(Self { reader })
     }
 
@@ -38,7 +38,7 @@ impl FastqReader {
     /// ```no_run
     /// use oxbow::fastq::FastqReader;
     ///
-    /// let mut reader = FastqReader::new("sample.fastq.gz").unwrap();
+    /// let mut reader = FastqReader::new_from_path("sample.fastq.gz").unwrap();
     /// let ipc = reader.records_to_ipc().unwrap();
     /// ```
     pub fn records_to_ipc(&mut self) -> Result<Vec<u8>, ArrowError> {
@@ -71,13 +71,13 @@ impl BatchBuilder for FastqBatchBuilder {
 
     fn push(&mut self, record: Self::Record<'_>) {
         self.name
-            .append_value(std::str::from_utf8(record.name()).unwrap());
+            .append_value(str::from_utf8(record.name()).unwrap());
         self.description
-            .append_value(std::str::from_utf8(record.description()).unwrap());
+            .append_value(str::from_utf8(record.description()).unwrap());
         self.sequence
-            .append_value(std::str::from_utf8(record.sequence()).unwrap());
+            .append_value(str::from_utf8(record.sequence()).unwrap());
         self.quality_scores
-            .append_value(std::str::from_utf8(record.quality_scores()).unwrap());
+            .append_value(str::from_utf8(record.quality_scores()).unwrap());
     }
 
     fn finish(mut self) -> Result<RecordBatch, ArrowError> {
