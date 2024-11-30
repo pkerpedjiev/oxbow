@@ -20,21 +20,23 @@ use std::str::FromStr;
 
 use crate::batch_builder::{write_ipc_err, BatchBuilder};
 
-pub fn index_from_reader<R>(mut read: R) -> io::Result<csi::Index>
+pub fn index_from_reader<R>(read: R) -> io::Result<csi::Index>
 where
     R: Read + Seek,
 {
+    let mut buf_read = std::io::BufReader::with_capacity(1024 * 1024, read);
     // Unlike .tbi and .csi, .bai is not bgzf-compressed
     // so we read off the magic directly.
     let mut magic = [0; 4];
-    read.read_exact(&mut magic)?;
-    read.seek(io::SeekFrom::Start(0))?;
+    buf_read.read_exact(&mut magic)?;
+    buf_read.seek(io::SeekFrom::Start(0))?;
     if magic == b"BAI\x01" as &[u8] {
-        let mut bai_reader = bam::bai::Reader::new(read);
+
+        let mut bai_reader = bam::bai::Reader::new(buf_read);
         bai_reader.read_header()?;
         bai_reader.read_index()
     } else {
-        let mut csi_reader = csi::Reader::new(read);
+        let mut csi_reader = csi::Reader::new(buf_read);
         csi_reader.read_index()
     }
 }
@@ -76,10 +78,11 @@ impl BamReader<BufReader<File>> {
     }
 }
 
-impl<R: Read + Seek> BamReader<R> {
+impl<R: Read + Seek> BamReader<BufReader<R>> {
     /// Creates a BAM reader.
     pub fn new(read: R, index: csi::Index) -> std::io::Result<Self> {
-        let mut reader = bam::Reader::new(read);
+        let buf_read = std::io::BufReader::with_capacity(1024 * 1024, read);
+        let mut reader = bam::Reader::new(buf_read);
         let header = reader.read_header()?;
 
         Ok(Self {
