@@ -81,7 +81,7 @@ impl BamReader<BufReader<File>> {
 impl<R: Read + Seek> BamReader<BufReader<R>> {
     /// Creates a BAM reader.
     pub fn new(read: R, index: csi::Index) -> std::io::Result<Self> {
-        let buf_read = std::io::BufReader::with_capacity(1024 * 1024, read);
+        let buf_read = std::io::BufReader::with_capacity(678910, read);
         let mut reader = bam::Reader::new(buf_read);
         let header = reader.read_header()?;
 
